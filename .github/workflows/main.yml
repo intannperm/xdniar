@@ -1,7 +1,6 @@
-name: Ubuntu + ngrok (SSH + HTTP 8080)
+name: Ubuntu + ngrok (SSH password + HTTP 8080)
 
-on:
-  workflow_dispatch: {}
+on: { workflow_dispatch: {} }
 
 jobs:
   runner:
@@ -15,31 +14,44 @@ jobs:
           cat /etc/os-release
           date -u +"Start at: %Y-%m-%d %H:%M:%S UTC"
 
-      # Install OpenSSH + paksa pubkey-only
-      - name: Install OpenSSH, jq, curl dan set sshd (pubkey only)
+      - name: Install OpenSSH, jq, curl dan set sshd (enable password + pubkey)
+        env:
+          RUNNER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y openssh-server jq curl
           sudo mkdir -p /run/sshd
-          # Drop-in config agar pubkey-only
-          echo "PasswordAuthentication no"            | sudo tee /etc/ssh/sshd_config.d/99-actions.conf
-          echo "PubkeyAuthentication yes"             | sudo tee -a /etc/ssh/sshd_config.d/99-actions.conf
-          echo "ChallengeResponseAuthentication no"   | sudo tee -a /etc/ssh/sshd_config.d/99-actions.conf
-          echo "UsePAM yes"                           | sudo tee -a /etc/ssh/sshd_config.d/99-actions.conf
-          echo "AuthorizedKeysFile .ssh/authorized_keys" | sudo tee -a /etc/ssh/sshd_config.d/99-actions.conf
-          sudo service ssh restart
-          # Lihat config efektif (sekadar verifikasi di log)
-          sudo sshd -T | egrep 'passwordauthentication|pubkeyauthentication|authorizedkeysfile|usepam' || true
 
-      # authorized_keys dari secret (tanpa chown)
-      - name: Setup authorized_keys
+          # Set password user 'runner' dari secret
+          test -n "$RUNNER_PASSWORD" || (echo "Secret RUNNER_PASSWORD kosong"; exit 1)
+          echo "runner:${RUNNER_PASSWORD}" | sudo chpasswd
+
+          # Drop-in config: aktifkan password & pubkey, batasi user
+          {
+            echo "PasswordAuthentication yes"
+            echo "PubkeyAuthentication yes"
+            echo "ChallengeResponseAuthentication no"
+            echo "UsePAM yes"
+            echo "AuthorizedKeysFile .ssh/authorized_keys"
+            echo "PermitRootLogin no"
+            echo "LoginGraceTime 30"
+            echo "MaxAuthTries 3"
+            echo "AllowUsers runner"
+          } | sudo tee /etc/ssh/sshd_config.d/99-actions.conf
+
+          sudo service ssh restart
+
+          # Tampilkan konfigurasi efektif (untuk verifikasi di log)
+          sudo sshd -T | egrep 'passwordauthentication|pubkeyauthentication|authorizedkeysfile|permitrootlogin|maxauthtries|logingracetime|usepam|allowusers' || true
+
+      - name: Setup authorized_keys (opsional, jika pakai pubkey)
+        if: ${{ secrets.SSH_PUBLIC_KEY != '' }}
         shell: bash
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set -euxo pipefail
-          test -n "$SSH_PUBLIC_KEY" || (echo "Secret SSH_PUBLIC_KEY kosong"; exit 1)
           install -d -m 700 "$HOME/.ssh"
           printf "%s\n" "$SSH_PUBLIC_KEY" > "$HOME/.ssh/authorized_keys"
           sed -i 's/\r$//' "$HOME/.ssh/authorized_keys"   # buang CRLF jika ada
@@ -47,7 +59,6 @@ jobs:
           ls -ld "$HOME/.ssh"; ls -l "$HOME/.ssh/authorized_keys"
           echo -n "authorized_keys head: "; head -c 40 "$HOME/.ssh/authorized_keys" || true; echo
 
-      # Install & auth ngrok
       - name: Install & auth ngrok
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
@@ -58,12 +69,10 @@ jobs:
           ngrok config add-authtoken "$NGROK_AUTHTOKEN"
           ngrok version
 
-      # Tunnel SSH (TCP 22)
       - name: Start ngrok TCP 22 (SSH)
         run: |
           set -euxo pipefail
           nohup ngrok tcp 22 --region ap --log=stdout > ngrok-ssh.log 2>&1 &
-          # Tunggu dashboard siap & ambil URL
           for i in {1..30}; do
             if curl -sf http://127.0.0.1:4040/api/tunnels | jq -e '.tunnels[] | select(.proto=="tcp")' > /dev/null; then break; fi
             sleep 2
@@ -73,7 +82,7 @@ jobs:
           TCP_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="tcp") | .public_url')
           echo "NGROK_TCP_URL=$TCP_URL" >> $GITHUB_ENV
 
-      - name: Cara konek SSH
+      - name: Cara konek SSH (pakai password atau key)
         run: |
           set -euxo pipefail
           HOST=$(echo "$NGROK_TCP_URL" | sed -E 's#^tcp://([^:]+):([0-9]+)$#\1#')
@@ -83,13 +92,17 @@ jobs:
           echo "🔐 SSH via ngrok:"
           echo "Host : $HOST"
           echo "Port : $PORT"
+          echo "User : runner"
+          echo "Pass : (secret RUNNER_PASSWORD)"
           echo ""
-          echo "Perintah (Linux/macOS/Termux):"
+          echo "Perintah (password):"
+          echo "  ssh -o StrictHostKeyChecking=no runner@${HOST} -p ${PORT}"
+          echo ""
+          echo "Perintah (pubkey, jika di-set):"
           echo "  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 runner@${HOST} -p ${PORT}"
           echo "========================================"
           echo ""
 
-      # Tunnel HTTP 8080
       - name: Start ngrok HTTP 8080 (Web preview)
         run: |
           set -euxo pipefail
@@ -109,7 +122,6 @@ jobs:
           echo "========================================"
           echo ""
 
-      # Keep-alive sampai timeout
       - name: Keep-alive
         run: |
           echo "Tunnels aktif. Workflow hidup sampai timeout (~360 menit) atau kamu cancel."
