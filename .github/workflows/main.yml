@@ -1,6 +1,7 @@
 name: Ubuntu + ngrok (SSH password + HTTP 8080)
 
-on: { workflow_dispatch: {} }
+on:
+  workflow_dispatch: {}
 
 jobs:
   runner:
@@ -41,23 +42,24 @@ jobs:
           } | sudo tee /etc/ssh/sshd_config.d/99-actions.conf
 
           sudo service ssh restart
-
-          # Tampilkan konfigurasi efektif (untuk verifikasi di log)
           sudo sshd -T | egrep 'passwordauthentication|pubkeyauthentication|authorizedkeysfile|permitrootlogin|maxauthtries|logingracetime|usepam|allowusers' || true
 
-      - name: Setup authorized_keys (opsional, jika pakai pubkey)
-        if: ${{ secrets.SSH_PUBLIC_KEY != '' }}
+      - name: Setup authorized_keys (opsional, dipakai kalau secret ada)
         shell: bash
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set -euxo pipefail
-          install -d -m 700 "$HOME/.ssh"
-          printf "%s\n" "$SSH_PUBLIC_KEY" > "$HOME/.ssh/authorized_keys"
-          sed -i 's/\r$//' "$HOME/.ssh/authorized_keys"   # buang CRLF jika ada
-          chmod 600 "$HOME/.ssh/authorized_keys"
-          ls -ld "$HOME/.ssh"; ls -l "$HOME/.ssh/authorized_keys"
-          echo -n "authorized_keys head: "; head -c 40 "$HOME/.ssh/authorized_keys" || true; echo
+          if [ -n "${SSH_PUBLIC_KEY:-}" ]; then
+            install -d -m 700 "$HOME/.ssh"
+            printf "%s\n" "$SSH_PUBLIC_KEY" > "$HOME/.ssh/authorized_keys"
+            sed -i 's/\r$//' "$HOME/.ssh/authorized_keys"   # buang CRLF jika ada
+            chmod 600 "$HOME/.ssh/authorized_keys"
+            ls -ld "$HOME/.ssh"; ls -l "$HOME/.ssh/authorized_keys"
+            echo -n "authorized_keys head: "; head -c 40 "$HOME/.ssh/authorized_keys" || true; echo
+          else
+            echo "SSH_PUBLIC_KEY tidak di-set; lanjut pakai password saja."
+          fi
 
       - name: Install & auth ngrok
         env:
@@ -82,7 +84,7 @@ jobs:
           TCP_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="tcp") | .public_url')
           echo "NGROK_TCP_URL=$TCP_URL" >> $GITHUB_ENV
 
-      - name: Cara konek SSH (pakai password atau key)
+      - name: Cara konek SSH (password atau key)
         run: |
           set -euxo pipefail
           HOST=$(echo "$NGROK_TCP_URL" | sed -E 's#^tcp://([^:]+):([0-9]+)$#\1#')
