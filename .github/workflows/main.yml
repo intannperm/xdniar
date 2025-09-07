@@ -1,0 +1,195 @@
+name: Ubuntu + ngrok (SSH & HTTP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_http:
+        description: "Buka HTTP tunnel (port 8080)?"
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      http_port:
+        description: "Port HTTP lokal (jika enable_http=true)"
+        required: true
+        default: "8080"
+      ngrok_region:
+        description: "Region ngrok (ap, us, eu, au, sa, jp, in)"
+        required: true
+        default: "ap"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu-ngrok
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Runner Ubuntu dengan ngrok
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # maksimal sebelum runner otomatis berhenti
+
+    steps:
+      - name: Info OS & waktu
+        run: |
+          uname -a
+          cat /etc/os-release
+          date -u +"Start at: %Y-%m-%d %H:%M:%S UTC"
+
+      # --- Siapkan SSH server (key-based auth) ---
+      - name: Install & konfigurasi OpenSSH server
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+
+          # pastikan service bisa jalan
+          sudo mkdir -p /run/sshd
+
+          # aktifkan login untuk user 'runner' pakai AuthorizedKeys
+          # authorized_keys akan di-set di langkah berikutnya
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?UsePAM .*/UsePAM yes/' /etc/ssh/sshd_config
+
+          # buka service
+          sudo service ssh restart
+          sudo systemctl status ssh --no-pager || true
+
+      - name: Tambahkan authorized_keys dari secret
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -euxo pipefail
+          test -n "$SSH_PUBLIC_KEY" || (echo "Secret SSH_PUBLIC_KEY kosong"; exit 1)
+          install -d -m 700 /home/runner/.ssh
+          echo "$SSH_PUBLIC_KEY" | tee -a /home/runner/.ssh/authorized_keys > /dev/null
+          chmod 600 /home/runner/.ssh/authorized_keys
+          chown -R runner:runner /home/runner/.ssh
+
+      # --- Install ngrok & autentikasi ---
+      - name: Install ngrok
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz -o ngrok.tgz
+          tar -xzf ngrok.tgz
+          sudo mv ngrok /usr/local/bin/ngrok
+          ngrok version
+
+      - name: Autentikasi ngrok
+        shell: bash
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          set -euxo pipefail
+          test -n "$NGROK_AUTHTOKEN" || (echo "Secret NGROK_AUTHTOKEN kosong"; exit 1)
+          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+
+      # --- Jalankan tunnel SSH (TCP 22) ---
+      - name: Start ngrok TCP 22 (SSH)
+        shell: bash
+        env:
+          NGROK_REGION: ${{ inputs.ngrok_region }}
+        run: |
+          set -euxo pipefail
+          # jalankan di background, expose API di :4040
+          nohup ngrok tcp 22 --region "${NGROK_REGION}" --log=stdout > ngrok-ssh.log 2>&1 &
+
+          # tunggu dashboard siap
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:4040/api/tunnels | grep -q '"proto":"tcp"'; then
+              break
+            fi
+            sleep 2
+          done
+
+          echo "---- Tunnels ----"
+          curl -s http://127.0.0.1:4040/api/tunnels | jq .
+
+          # Ambil alamat tcp, contoh: tcp://0.tcp.ap.ngrok.io:12345
+          TCP_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="tcp") | .public_url')
+          echo "NGROK_TCP_URL=$TCP_URL" | tee -a $GITHUB_ENV
+
+      - name: Print cara konek SSH
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -z "${NGROK_TCP_URL:-}" ]; then
+            echo "Gagal mengambil NGROK_TCP_URL"; exit 1
+          fi
+          # parse host & port
+          HOST=$(echo "$NGROK_TCP_URL" | sed -E 's#^tcp://([^:]+):([0-9]+)$#\1#')
+          PORT=$(echo "$NGROK_TCP_URL" | sed -E 's#^tcp://([^:]+):([0-9]+)$#\2#')
+
+          echo ""
+          echo "========================================"
+          echo "🔐 SSH ke GitHub Runner via ngrok:"
+          echo "Host : $HOST"
+          echo "Port : $PORT"
+          echo ""
+          echo "Perintah (Linux/macOS):"
+          echo "  ssh -o StrictHostKeyChecking=no runner@${HOST} -p ${PORT}"
+          echo ""
+          echo "Perintah (Windows PowerShell):"
+          echo '  ssh -o StrictHostKeyChecking=no runner@'"${HOST}"' -p '"${PORT}"
+          echo "========================================"
+          echo ""
+
+      # --- Opsional: HTTP tunnel untuk app di port tertentu (default 8080) ---
+      - name: Start ngrok HTTP (opsional)
+        if: ${{ inputs.enable_http == 'true' }}
+        shell: bash
+        env:
+          NGROK_REGION: ${{ inputs.ngrok_region }}
+          HTTP_PORT: ${{ inputs.http_port }}
+        run: |
+          set -euxo pipefail
+          nohup ngrok http "http://127.0.0.1:${HTTP_PORT}" --region "${NGROK_REGION}" --log=stdout > ngrok-http.log 2>&1 &
+
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:4040/api/tunnels | jq -e '.tunnels[] | select(.proto=="https")' > /dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+          echo "---- Tunnels ----"
+          curl -s http://127.0.0.1:4040/api/tunnels | jq .
+
+          HTTPS_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url')
+          echo "NGROK_HTTPS_URL=$HTTPS_URL" | tee -a $GITHUB_ENV
+
+      - name: Info HTTP URL (jika aktif)
+        if: ${{ inputs.enable_http == 'true' }}
+        shell: bash
+        run: |
+          echo ""
+          echo "========================================"
+          echo "🌐 HTTP publik via ngrok:"
+          echo "URL : ${NGROK_HTTPS_URL}"
+          echo "Catatan: jalankan server kamu di port ${{ inputs.http_port }} (contoh: 'python3 -m http.server ${{ inputs.http_port }}')"
+          echo "========================================"
+          echo ""
+
+      # --- Contoh: jalankan web dummy (opsional) ---
+      # - name: (Contoh) Start web di port 8080
+      #   if: ${{ inputs.enable_http == 'true' }}
+      #   run: |
+      #     nohup python3 -m http.server ${{ inputs.http_port }} > web.log 2>&1 &
+
+      # --- Keep-alive sampai job berakhir ---
+      - name: Keep-alive
+        run: |
+          echo "Tunnels aktif. Job akan tetap hidup sampai timeout (~350 menit) atau workflow dihentikan."
+          echo "Untuk berhenti: Cancel workflow run dari tab Actions."
+          while true; do
+            date -u +"Heartbeat: %Y-%m-%d %H:%M:%S UTC"
+            sleep 60
+          done
